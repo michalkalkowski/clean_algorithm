@@ -28,9 +28,11 @@ identifies individual components (wave packets) present in the measured signal.
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.signal import hilbert
+from tqdm import trange
 
 
-def extract_CLEAN(measured_signal, original_signal, delta_t, threshold=0.4):
+def extract_CLEAN_single(measured_signal, original_signal, delta_t, threshold=0.4,
+        max_iter=10):
     """
     Applies the CLEAN algorithm to extract individual components from a multi-
     component signal. The algorithm is based in the assumption that the
@@ -52,7 +54,8 @@ def extract_CLEAN(measured_signal, original_signal, delta_t, threshold=0.4):
 
     Parameters:
     ---
-    measured_signal: ndarray, measured signal to decompose
+    measured_signal: ndarray, measured signal to decompose of size (N,) where N
+                    is the number of samples (single sensor signal)
     original_signal: ndarray, original (transmitted) signal,
                               e.g. the excitation applied to the structure
                               under test
@@ -87,8 +90,10 @@ def extract_CLEAN(measured_signal, original_signal, delta_t, threshold=0.4):
     # Dummy values initialising the loop
     amplitude = 1
     amp_max = 2
-
+    iters = 0
     while amplitude > threshold*amp_max:
+        if iters > max_iter:
+            break
         r_t = np.fft.ifft(residue)
         # Remove numerical noise
         r_t = r_t.real
@@ -128,9 +133,110 @@ def extract_CLEAN(measured_signal, original_signal, delta_t, threshold=0.4):
         # Assign maximum amplitude if this is the first iteration
         if len(amplitudes) == 1:
             amp_max = amplitude
+        iters += 1
     return (np.array(amplitudes[:-1]), np.array(delays[:-1]),
             np.array(phases[:-1]), np.array(components[:-1]))
 
+def extract_CLEAN_matrix(measured_signal, original_signal, delta_t,
+                         max_iter=10):
+    """
+    Applies the CLEAN algorithm to extract individual components from a matrix
+    of multi-component signals. The algorithm is based in the assumption that the
+    measured signal is a sum of scaled, delayed and shifted copies of
+    the original signal.
+
+    Individual components are extracted by iterating over dominant components
+    of the spectrum. The algorithms starts from taking the spectrum of the
+    input signal as a starting residue. It determines the amplitude, phase
+    and time delay of the dominant component and subtracts the reconstructed
+    spectrum of this componend from the residue. A new residue is formed,
+    and the search for the dominant component restarts.
+
+    The loop is terminated after a chosen number of components is extracted
+    from all signals.
+
+    It is assumed that both the original and the measured signals are sampled
+    at the same rate.
+
+    Parameters:
+    ---
+    measured_signal: ndarray, measured signal to decompose of size (N,...) where N
+                    is the number of samples, and two subsequent dimensions
+                    correspond to the size of the sensor signal matrix
+    original_signal: ndarray, original (transmitted) signal,
+                              e.g. the excitation applied to the structure
+                              under test
+    delta_t: float, time increment
+    max_iter: int, number of iterations
+
+    Returns:
+    ---
+    amplitudes: ndarray, amplitudes of the individual components
+    delays: ndarray, tiem delays of the individual components
+    phases: ndarray, phase shifts of the individual components
+    components: ndarray, reconstructed time traces related to each individual
+                        component
+    """
+    original_spectrum = np.fft.fft(original_signal, axis=0)
+    measured_spectrum = np.fft.fft(measured_signal, axis=0)
+    omega = np.fft.fftfreq(len(original_signal), delta_t)
+    original_hilbert = hilbert(original_signal, axis=0)
+    original_argpeak = np.argmax(abs(original_hilbert))
+
+    # Initialise lists
+    amplitudes = np.zeros([max_iter, measured_signal.shape[1],
+                           measured_signal.shape[2]], 'complex')
+    delays = np.zeros([max_iter, measured_signal.shape[1],
+                       measured_signal.shape[2]], 'float')
+    phases = np.zeros([max_iter, measured_signal.shape[1],
+                       measured_signal.shape[2]], 'float')
+    components = np.zeros([max_iter] + list(measured_signal.shape))
+    # First residue is the spectrum of the measured signal
+    residue = np.copy(measured_spectrum)
+    for i in trange(max_iter):
+        r_t = np.fft.ifft(residue, axis=0)
+        # Remove numerical noise
+        r_t = r_t.real
+        # Find the dominant wave packet
+        r_hilbert = hilbert(r_t, axis=0)
+        r_argpeak = np.argmax(abs(r_hilbert), axis=0)
+        # Extract its amplitude
+        # Fancy indexing
+        ind_2, ind_3 = np.ogrid[0:r_argpeak.shape[0], 0:r_argpeak.shape[1]]
+        amplitude = abs(r_hilbert[r_argpeak, ind_2, ind_3])
+        # Extract time delay with reference to the envelope of the original
+        # signal
+        delay = (r_argpeak - original_argpeak)*delta_t
+        # Extract phase shift with reference to the original signal
+        phase = (np.angle(r_hilbert[r_argpeak, ind_2, ind_3]) -
+                 np.angle(original_hilbert)[original_argpeak] + 2*np.pi)
+
+        amplitudes[i] = amplitude
+        delays[i] = delay
+        phases[i] = phase
+        # Apply the delay and shift only to the positive half of the spectrum
+        if len(original_spectrum) % 2 == 0:
+            nyquist_index = int(len(original_spectrum)/2) + 1
+        else:
+            nyquist_index = int(np.ceil(len(original_spectrum)/2))
+        half_spectrum = original_spectrum[:nyquist_index]
+        component_spectrum = (amplitude[np.newaxis, :, :]
+                              *half_spectrum[:, np.newaxis, np.newaxis]
+                              * np.exp(1j*(-2*np.pi*omega[:nyquist_index,
+                                                          np.newaxis,
+                                                          np.newaxis]
+                                           *delay[np.newaxis, :, :]
+                                           + phase[np.newaxis, :, :])))
+        # Reconstruct the double-sided spectrum
+        if len(original_spectrum) % 2 == 0:
+            reconstructed = np.concatenate((
+                component_spectrum, component_spectrum.conj()[1:-1][::-1]))
+        else:
+            reconstructed = np.concatenate((
+                component_spectrum, component_spectrum.conj()[1:][::-1]))
+        residue = residue - reconstructed
+        components[i] = np.fft.ifft(reconstructed, axis=0)
+    return amplitudes, delays, phases, components
 
 def plot_components(time, measured_signal, components):
     """
